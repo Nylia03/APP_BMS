@@ -1,0 +1,133 @@
+#include <NimBLEDevice.h>  // Incluye la librería liviana BLE para ESP32
+
+// --- UUIDs del servicio y características específicas del BMS JBD (Xiaoxiang) ---
+static BLEUUID serviceUUID("0000ff00-0000-1000-8000-00805f9b34fb");      // Servicio principal
+static BLEUUID charWriteUUID("0000ff02-0000-1000-8000-00805f9b34fb");    // Característica para escribir comandos
+static BLEUUID charNotifyUUID("0000ff01-0000-1000-8000-00805f9b34fb");   // Característica para recibir notificaciones
+
+// --- Variables para manejar la conexión BLE ---
+static NimBLEAdvertisedDevice* foundDevice = nullptr;  // Guarda el dispositivo BMS encontrado
+static NimBLEClient* client = nullptr;                 // Cliente BLE del ESP32
+NimBLERemoteCharacteristic* pNotifyChar;               // Característica de notificación (lectura de datos)
+NimBLERemoteCharacteristic* pWriteChar;                // Característica de escritura (envío de comandos)
+
+// --- Comando específico para solicitar datos generales del BMS ---
+uint8_t bms_read_basic[] = {0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77};
+
+// --- Variables de control de tiempo y energía ---
+float energiaTotal_Wh = 0.0;                             // Acumulador de energía en Wh
+unsigned long ultimaLectura = 0;                         // Momento de la última lectura
+const unsigned long intervaloLectura = 2000;             // Intervalo de lectura: 2 segundos (2000 ms)
+
+// --- Función que decodifica la respuesta del BMS y la imprime en el monitor serial ---
+void decodeBMSData(uint8_t* data, size_t length) {
+  if (length < 13 || data[0] != 0xDD || data[length - 1] != 0x77) {
+    Serial.println("Respuesta inválida del BMS.");
+    return;
+  }
+
+  int offset = 4;  // Saltamos los primeros 4 bytes del encabezado
+
+  // Extraemos los valores del paquete recibido
+  uint16_t packVoltage = (data[offset] << 8) | data[offset + 1];         // Voltaje total (mV)
+  uint16_t rawCurrent = (data[offset + 2] << 8) | data[offset + 3];      // Corriente cruda
+  int16_t signedCurrent = (int16_t)rawCurrent;                           // Corriente con signo
+  uint16_t remainingCapacity = (data[offset + 4] << 8) | data[offset + 5]; // Capacidad restante
+  uint16_t fullCapacity = (data[offset + 6] << 8) | data[offset + 7];      // Capacidad total
+  uint8_t soc = data[offset + 8];                                        // Estado de carga (0–100%)
+  uint8_t cycleCount = data[offset + 9];                                 // Número de ciclos de carga
+
+  // Conversión a unidades reales
+  float voltage_V = packVoltage / 100.0;
+  float current_A = signedCurrent / 100.0;
+  float power_W = voltage_V * current_A;
+
+  // Cálculo de energía transferida en 2 segundos → W × (2 / 3600) horas
+  float energiaEn2s = power_W * (2.0 / 3600.0);
+  energiaTotal_Wh += energiaEn2s;
+
+  // --- Impresión de resultados en el monitor serial ---
+  Serial.println("==============================");
+  Serial.print("Voltaje pack:          "); Serial.print(voltage_V); Serial.println(" V");
+  Serial.print("Corriente:             "); Serial.print(current_A); Serial.println(" A");
+  Serial.print("Potencia:              "); Serial.print(power_W);   Serial.println(" W");
+  Serial.print("SOC (carga %):         "); Serial.print(soc);       Serial.println(" %");
+  Serial.print("Capacidad restante:    "); Serial.print(remainingCapacity / 100.0); Serial.println(" Ah");
+  Serial.print("Ciclos de carga:       "); Serial.println(cycleCount);
+  Serial.print("Energía acumulada:     "); Serial.print(energiaTotal_Wh); Serial.println(" Wh");
+  Serial.println("==============================");
+}
+
+// --- Callback que se ejecuta cuando el BMS envía una respuesta BLE ---
+void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* data, size_t length, bool isNotify) {
+  decodeBMSData(data, length);  // Procesa los datos recibidos
+}
+
+// --- Clase que detecta dispositivos BLE mientras el ESP32 escanea ---
+class MyAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+    if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(serviceUUID)) {
+      Serial.println("✅ BMS detectado. Deteniendo escaneo...");
+      foundDevice = advertisedDevice;           // Guarda el dispositivo encontrado
+      NimBLEDevice::getScan()->stop();          // Detiene el escaneo BLE
+    }
+  }
+};
+
+// --- Función que se conecta al BMS y prepara la comunicación ---
+void connectToBMS() {
+  client = NimBLEDevice::createClient();        // Crea un cliente BLE
+  client->connect(foundDevice);                 // Conecta al dispositivo BMS
+
+  NimBLERemoteService* service = client->getService(serviceUUID);
+  if (!service) {
+    Serial.println("❌ Servicio BLE no encontrado en el BMS.");
+    return;
+  }
+
+  // Obtiene las dos características BLE necesarias
+  pWriteChar = service->getCharacteristic(charWriteUUID);   // Para enviar comandos
+  pNotifyChar = service->getCharacteristic(charNotifyUUID); // Para recibir datos
+
+  // Se suscribe a las notificaciones del BMS
+  if (pNotifyChar && pNotifyChar->canNotify()) {
+    pNotifyChar->subscribe(true, notifyCallback);
+  }
+
+  // Envía el primer comando de lectura
+  if (pWriteChar && pWriteChar->canWrite()) {
+    pWriteChar->writeValue(bms_read_basic, sizeof(bms_read_basic), false);
+    Serial.println("📤 Comando enviado al BMS.");
+    ultimaLectura = millis();  // Guarda el tiempo actual
+  } else {
+    Serial.println("❌ No se pudo escribir al BMS.");
+  }
+}
+
+// --- setup(): se ejecuta una sola vez al encender el ESP32 ---
+void setup() {
+  Serial.begin(115200);                     // Inicia el puerto serial
+  NimBLEDevice::init("ESP32-BMS");          // Inicializa BLE con el nombre "ESP32-BMS"
+  
+  // Inicia escaneo BLE
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks()); // Asocia la clase para detección
+  scan->setActiveScan(true);                   // Escaneo activo: más detallado
+  scan->start(5, false);                       // Escanea por 5 segundos
+}
+
+// --- loop(): se ejecuta constantemente ---
+void loop() {
+  // Si el BMS ya fue detectado pero aún no nos conectamos
+  if (foundDevice && !client) {
+    connectToBMS();
+  }
+
+  // Cada 2 segundos, enviamos el comando de lectura al BMS
+  if (client && millis() - ultimaLectura >= intervaloLectura) {
+    if (pWriteChar && pWriteChar->canWrite()) {
+      pWriteChar->writeValue(bms_read_basic, sizeof(bms_read_basic), false);  // Envía el comando nuevamente
+      ultimaLectura = millis();  // Reinicia el contador de tiempo
+    }
+  }
+}
