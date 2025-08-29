@@ -1,0 +1,143 @@
+#include <NimBLEDevice.h>
+
+// --- UUIDs del servicio y características del BMS JBD (Xiaoxiang) ---
+static BLEUUID serviceUUID("0000ff00-0000-1000-8000-00805f9b34fb");
+static BLEUUID charWriteUUID("0000ff02-0000-1000-8000-00805f9b34fb");
+static BLEUUID charNotifyUUID("0000ff01-0000-1000-8000-00805f9b34fb");
+
+// --- Variables para manejar la conexión BLE ---
+static NimBLEAdvertisedDevice* foundDevice = nullptr;
+static NimBLEClient* client = nullptr;
+NimBLERemoteCharacteristic* pNotifyChar = nullptr;
+NimBLERemoteCharacteristic* pWriteChar = nullptr;
+
+// --- Comando específico para solicitar datos generales del BMS ---
+uint8_t bms_read_basic[] = {0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77};
+
+// --- Variables de control de tiempo y energía ---
+float energiaTotal_Wh = 0.0;
+unsigned long ultimaLectura = 0;
+const unsigned long intervaloLectura = 2000;
+
+// --- Función que decodifica la respuesta del BMS ---
+void decodeBMSData(uint8_t* data, size_t length) {
+  if (length < 13 || data[0] != 0xDD || data[length - 1] != 0x77) {
+    Serial.println("Respuesta inválida del BMS.");
+    return;
+  }
+
+  int offset = 4;
+  uint16_t packVoltage = (data[offset] << 8) | data[offset + 1];
+  int16_t signedCurrent = (int16_t)((data[offset + 2] << 8) | data[offset + 3]);
+  uint16_t remainingCapacity = (data[offset + 4] << 8) | data[offset + 5];
+  uint16_t fullCapacity = (data[offset + 6] << 8) | data[offset + 7];
+  uint8_t soc = data[offset + 8];
+  uint8_t cycleCount = data[offset + 9];
+
+  float voltage_V = packVoltage / 100.0;
+  float current_A = signedCurrent / 100.0;
+  float power_W = voltage_V * current_A;
+
+  float energiaEnIntervalo = power_W * (intervaloLectura / 3600000.0);
+  energiaTotal_Wh += energiaEnIntervalo;
+
+  Serial.println("==============================");
+  Serial.print("Voltaje pack: "); Serial.print(voltage_V); Serial.println(" V");
+  Serial.print("Corriente: "); Serial.print(current_A); Serial.println(" A");
+  Serial.print("Potencia: "); Serial.print(power_W); Serial.println(" W");
+  Serial.print("SOC (carga %): "); Serial.print(soc); Serial.println(" %");
+  Serial.print("Capacidad restante: "); Serial.print(remainingCapacity / 100.0); Serial.println(" Ah");
+  Serial.print("Capacidad total: "); Serial.print(fullCapacity / 100.0); Serial.println(" Ah");
+  Serial.print("Ciclos de carga: "); Serial.println(cycleCount);
+  Serial.print("Energía acumulada: "); Serial.print(energiaTotal_Wh); Serial.println(" Wh");
+  Serial.println("==============================");
+}
+
+// --- Callback para notificaciones ---
+void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* data, size_t length, bool isNotify) {
+  decodeBMSData(data, length);
+}
+
+// --- Clase de callback para escaneo compatible con ESP32-C3 ---
+class MyScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(NimBLEAdvertisedDevice* advertisedDevice, bool isNewDevice) {
+    if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(serviceUUID)) {
+      Serial.println("✅ BMS detectado. Deteniendo escaneo...");
+      foundDevice = advertisedDevice;
+      NimBLEDevice::getScan()->stop();
+    }
+  }
+};
+
+// --- Función para conectar al BMS ---
+void connectToBMS() {
+  if (!foundDevice) return;
+
+  client = NimBLEDevice::createClient();
+  if (!client->connect(foundDevice)) {
+    Serial.println("❌ Falló la conexión, reintentando...");
+    client = nullptr;
+    return;
+  }
+
+  NimBLERemoteService* service = client->getService(serviceUUID);
+  if (!service) {
+    Serial.println("❌ Servicio BLE no encontrado.");
+    client->disconnect();
+    client = nullptr;
+    return;
+  }
+
+  pWriteChar = service->getCharacteristic(charWriteUUID);
+  pNotifyChar = service->getCharacteristic(charNotifyUUID);
+
+  if (pNotifyChar && pNotifyChar->canNotify()) {
+    pNotifyChar->subscribe(true, notifyCallback);
+  }
+
+  if (pWriteChar && pWriteChar->canWrite()) {
+    pWriteChar->writeValue(bms_read_basic, sizeof(bms_read_basic), false);
+    Serial.println("📤 Comando enviado al BMS.");
+    ultimaLectura = millis();
+  } else {
+    Serial.println("❌ No se pudo escribir al BMS.");
+  }
+}
+
+// --- setup() ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("🔌 ESP32-C3 encendido");
+  
+  NimBLEDevice::init("ESP32-BMS");
+  Serial.println("🔍 Iniciando escaneo BLE...");
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(new MyScanCallbacks());
+  scan->setActiveScan(true);
+  scan->start(5, false);
+
+  Serial.println("⏳ Escaneo en curso (5s)...");
+}
+
+// --- loop() ---
+void loop() {
+  // Reconectar si se pierde la conexión
+  if (client && !client->isConnected()) {
+    Serial.println("❌ Conexión perdida, reconectando...");
+    client->disconnect();
+    client = nullptr;
+    connectToBMS();
+  }
+
+  if (foundDevice && !client) {
+    connectToBMS();
+  }
+
+  if (client && millis() - ultimaLectura >= intervaloLectura) {
+    if (pWriteChar && pWriteChar->canWrite()) {
+      pWriteChar->writeValue(bms_read_basic, sizeof(bms_read_basic), false);
+      ultimaLectura = millis();
+    }
+  }
+}
